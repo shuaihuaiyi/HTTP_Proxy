@@ -8,7 +8,7 @@
 
 #pragma comment(lib,"Ws2_32.lib")
 
-#define MAXSIZE 65507 //发送数据报文的最大长度
+#define MAXSIZE 65536 //发送数据报文的最大长度
 #define HTTP_PORT 80 //http 服务器端口
 
 class MyProxy
@@ -43,8 +43,7 @@ private:
 		SOCKET clientSocket;
 		SOCKET serverSocket;
 	};
-
-	BOOL InitSocket();
+	//函数声明
 	static unsigned __stdcall ProxyThread(LPVOID lpParameter);
 	static void ParseHttpHead(char* buffer, HttpHeader* httpHeader);
 	static BOOL ConnectToServer(SOCKET* serverSocket, char* host);
@@ -53,9 +52,37 @@ private:
 inline MyProxy::MyProxy()
 {
 	printf("代理服务器正在启动\n");
-	printf("初始化...\n");
-	if (!InitSocket()) {
-		printf("socket 初始化失败\n");
+	WSADATA wsaData;
+	//版本 2.2
+	WORD wVersionRequested = MAKEWORD(2, 2);
+	//加载 dll 文件 Scoket 库
+	int err = WSAStartup(wVersionRequested, &wsaData);
+	if (err != 0) {
+		//找不到 winsock.dll
+		printf("加载 winsock 失败，错误代码为: %d\n", WSAGetLastError());
+		return;
+	}
+	if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2)
+	{
+		printf("不能找到正确的 winsock 版本\n");
+		WSACleanup();
+		return;
+	}
+	ProxyServer = socket(AF_INET, SOCK_STREAM, 0);
+	if (INVALID_SOCKET == ProxyServer) {
+		printf("创建套接字失败，错误代码为：%d\n", WSAGetLastError());
+		WSACleanup();
+		return;
+	}
+	ProxyServerAddr.sin_family = AF_INET;
+	ProxyServerAddr.sin_port = htons(ProxyPort);
+	ProxyServerAddr.sin_addr.S_un.S_addr = INADDR_ANY;
+	if (bind(ProxyServer, reinterpret_cast<SOCKADDR*>(&ProxyServerAddr), sizeof(SOCKADDR)) == SOCKET_ERROR) {
+		printf("绑定套接字失败\n");
+		return;
+	}
+	if (listen(ProxyServer, SOMAXCONN) == SOCKET_ERROR) {
+		printf("监听端口%d 失败", ProxyPort);
 		return;
 	}
 	printf("代理服务器正在运行，监听端口 %d\n", ProxyPort);
@@ -81,49 +108,6 @@ inline MyProxy::~MyProxy()
 }
 
 //************************************
-// Method:	InitSocket
-// FullName:	InitSocket
-// Access:	public
-// Returns:	BOOL
-// Qualifier: 初始化套接字
-//************************************ 
-inline BOOL MyProxy::InitSocket() {
-	WSADATA wsaData;
-	//版本 2.2
-	WORD wVersionRequested = MAKEWORD(2, 2);
-	//加载 dll 文件 Scoket 库
-	int err = WSAStartup(wVersionRequested, &wsaData);
-	if (err != 0) {
-		//找不到 winsock.dll
-		printf("加载 winsock 失败，错误代码为: %d\n", WSAGetLastError());
-		return FALSE;
-	}
-	if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2)
-	{
-		printf("不能找到正确的 winsock 版本\n");
-		WSACleanup();
-		return FALSE;
-	}
-	ProxyServer = socket(AF_INET, SOCK_STREAM, 0);
-	if (INVALID_SOCKET == ProxyServer) {
-		printf("创建套接字失败，错误代码为：%d\n", WSAGetLastError());
-		return FALSE;
-	}
-	ProxyServerAddr.sin_family = AF_INET;
-	ProxyServerAddr.sin_port = htons(ProxyPort);
-	ProxyServerAddr.sin_addr.S_un.S_addr = INADDR_ANY;
-	if (bind(ProxyServer, reinterpret_cast<SOCKADDR*>(&ProxyServerAddr), sizeof(SOCKADDR)) == SOCKET_ERROR) {
-		printf("绑定套接字失败\n");
-		return FALSE;
-	}
-	if (listen(ProxyServer, SOMAXCONN) == SOCKET_ERROR) {
-		printf("监听端口%d 失败", ProxyPort);
-		return FALSE;
-	}
-	return TRUE;
-}
-
-//************************************
 // Method:	ProxyThread
 // FullName:	ProxyThread
 // Access:	public
@@ -134,13 +118,14 @@ inline BOOL MyProxy::InitSocket() {
 inline unsigned int __stdcall MyProxy::ProxyThread(LPVOID lpParameter)
 {
 	char Buffer[MAXSIZE];
+	char* buffer = nullptr,*temp = nullptr;
 	char *CacheBuffer;
 	ZeroMemory(Buffer, MAXSIZE);
 	int recvSize;
 	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->clientSocket, Buffer, MAXSIZE, 0);
 	if (recvSize <= 0)
 	{
-		std::cout << "没有收到请求！" << std::endl;
+		//std::cout << "没有收到请求！" << std::endl;
 		goto error;
 	}
 	HttpHeader* httpHeader = new HttpHeader();
@@ -149,16 +134,47 @@ inline unsigned int __stdcall MyProxy::ProxyThread(LPVOID lpParameter)
 	memcpy(CacheBuffer, Buffer, recvSize);
 	ParseHttpHead(CacheBuffer, httpHeader);
 	delete[] CacheBuffer;
+	//去除浏览器添加的代理标识
+	char host[64] = "http://";
+	strcat_s(host, httpHeader->host);
+	unsigned int  len = strlen(Buffer);
+	temp = new char[len + 1];
+	buffer = new char[len + 1];
+	ZeroMemory(temp, len + 1);
+	ZeroMemory(buffer, len + 1);
+	for (unsigned int i = 0; i < len; i++)
+	{
+		if (strncmp(Buffer + i, "Proxy-Connection: keep-alive", 29) == 0)
+		{
+			strcat_s(temp + i, len + 1, "Connection: close");
+			ZeroMemory(temp + i + 18, len - i - 18);
+			strcat_s(temp + i + 18, len + 1, Buffer + i + 29);
+			recvSize -= 11;
+			break;
+		}
+		temp[i] = Buffer[i];
+	}
+	for (unsigned int i = 0; i < len; i++)
+	{
+		if (strncmp(temp + i, host, strlen(host)) == 0)
+		{
+			strcat_s(buffer + i, len + 1, temp + i + strlen(host));
+			recvSize -= strlen(host);
+			break;
+		}
+		buffer[i] = temp[i];
+	}
+	delete[] temp;
 	if (!ConnectToServer(&static_cast<ProxyParam*>(lpParameter)->serverSocket, httpHeader->host))
 	{
 		std::cout << "连接服务器失败！" << std::endl;
 		goto error;
 	}
-	printf("代理连接主机 %s 成功\n", httpHeader->host);
+	//printf("代理连接主机 %s 成功\n", httpHeader->host);
 	//将客户端发送的 HTTP 数据报文直接转发给目标服务器
-	int ret = send(static_cast<ProxyParam *>(lpParameter)->serverSocket, Buffer, recvSize, 0);
+	int ret = send(static_cast<ProxyParam *>(lpParameter)->serverSocket, buffer, recvSize, 0);
 	//等待目标服务器返回数据
-	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->serverSocket, Buffer, MAXSIZE, 0);
+	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->serverSocket, Buffer, MAXSIZE+1, 0);
 	if (recvSize <= 0)
 	{
 		std::cout << "服务器没有返回数据！" << std::endl;
@@ -201,7 +217,6 @@ inline void MyProxy::ParseHttpHead(char *buffer, HttpHeader * httpHeader)
 		memcpy(httpHeader->method, "POST", 4);
 		memcpy(httpHeader->url, &p[5], strlen(p) - 14);
 	}
-	printf("%s\n", httpHeader->url);
 	p = strtok_s(nullptr, delim, &ptr);
 	while (p) {
 		switch (p[0]) {
