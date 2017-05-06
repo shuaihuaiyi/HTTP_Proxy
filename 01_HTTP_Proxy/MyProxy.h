@@ -1,20 +1,28 @@
 #pragma once
+#include <vector>
 #include <stdio.h>
 #include <Windows.h>
 #include <process.h>
 #include <string.h>
-#include <tchar.h>
 #include <iostream>
+#include <unordered_map>
 
 #pragma comment(lib,"Ws2_32.lib")
 
 #define MAXSIZE 65536 //发送数据报文的最大长度
 #define HTTP_PORT 80 //http 服务器端口
 
+class MyProxy;
+using namespace std;
+struct ProxyParam {
+	SOCKET clientSocket;
+	SOCKET serverSocket;
+	MyProxy* myproxy;
+};
 class MyProxy
 {
 public:
-	MyProxy();
+	MyProxy(int port, vector<string> blackList, unordered_map<string, string> redirect);
 	~MyProxy();
 private:
 	//Http 重要头部数据
@@ -31,27 +39,20 @@ private:
 	//代理相关参数
 	SOCKET ProxyServer;
 	sockaddr_in ProxyServerAddr;
-	const int ProxyPort = 10240;
-
-	//由于新的连接都使用新线程进行处理，对线程的频繁的创建和销毁特别浪费资源
-	//可以使用线程池技术提高服务器效率
-	//const int ProxyThreadMaxNum = 20;
-	//HANDLE ProxyThreadHandle[ProxyThreadMaxNum] = {0};
-	//DWORD ProxyThreadDW[ProxyThreadMaxNum] = {0};
-
-	struct ProxyParam {
-		SOCKET clientSocket;
-		SOCKET serverSocket;
-	};
+	int ProxyPort;
+	vector<string> blackList;
+	unordered_map<string, string> redirect;
 	//函数声明
-	static unsigned __stdcall ProxyThread(LPVOID lpParameter);
+	static unsigned int __stdcall ProxyThread(LPVOID lpParameter);
 	static void ParseHttpHead(char* buffer, HttpHeader* httpHeader);
 	static BOOL ConnectToServer(SOCKET* serverSocket, char* host);
 };
 
-inline MyProxy::MyProxy()
+inline MyProxy::MyProxy(int port, vector<string> blackList, unordered_map<string, string> redirect)
 {
-	printf("代理服务器正在启动\n");
+	ProxyPort = port;
+	this->blackList = blackList;
+	this->redirect = redirect;
 	WSADATA wsaData;
 	//版本 2.2
 	WORD wVersionRequested = MAKEWORD(2, 2);
@@ -86,18 +87,18 @@ inline MyProxy::MyProxy()
 		return;
 	}
 	printf("代理服务器正在运行，监听端口 %d\n", ProxyPort);
-	SOCKET acceptSocket = INVALID_SOCKET;
-	//代理服务器不断监听
 	while (true) {
-		acceptSocket = accept(ProxyServer, nullptr, nullptr);
+		SOCKET acceptSocket = accept(ProxyServer, nullptr, nullptr);
 		ProxyParam *lpProxyParam = new ProxyParam;
 		if (lpProxyParam == nullptr) {
 			continue;
 		}
 		lpProxyParam->clientSocket = acceptSocket;
-		HANDLE hThread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &ProxyThread, static_cast<LPVOID>(lpProxyParam), 0, nullptr));
+		lpProxyParam->myproxy = this;
+		HANDLE hThread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &ProxyThread, LPVOID(lpProxyParam), 0, nullptr));
 		CloseHandle(hThread);
 		Sleep(200);
+		delete lpProxyParam;
 	}
 }
 
@@ -118,15 +119,17 @@ inline MyProxy::~MyProxy()
 inline unsigned int __stdcall MyProxy::ProxyThread(LPVOID lpParameter)
 {
 	char Buffer[MAXSIZE];
-	char* buffer = nullptr,*temp = nullptr;
+	char* buffer,*temp;
 	char *CacheBuffer;
 	ZeroMemory(Buffer, MAXSIZE);
 	int recvSize;
 	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->clientSocket, Buffer, MAXSIZE, 0);
 	if (recvSize <= 0)
 	{
-		//std::cout << "没有收到请求！" << std::endl;
-		goto error;
+		Sleep(200);
+		for (int i = 0;closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket) == SOCKET_ERROR && i < 10;i++);
+		_endthreadex(0);
+		return 0;
 	}
 	HttpHeader* httpHeader = new HttpHeader();
 	CacheBuffer = new char[recvSize + 1];
@@ -134,9 +137,53 @@ inline unsigned int __stdcall MyProxy::ProxyThread(LPVOID lpParameter)
 	memcpy(CacheBuffer, Buffer, recvSize);
 	ParseHttpHead(CacheBuffer, httpHeader);
 	delete[] CacheBuffer;
-	//去除浏览器添加的代理标识
-	char host[64] = "http://";
+	MyProxy* myproxy = static_cast<ProxyParam*>(lpParameter)->myproxy;
+	//处理访问控制
+	if(find(myproxy->blackList.begin(), myproxy->blackList.end(), httpHeader->host) != myproxy->blackList.end())
+	{
+		cout << httpHeader->host << "被管理员禁止访问！！" << endl;
+		Sleep(200);
+		//for (int i = 0;closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket) == SOCKET_ERROR && i < 10;i++);
+		int res = closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket);
+		delete httpHeader;
+		_endthreadex(0);
+		return 0;
+	}
+	char host[1024] = "http://";
 	strcat_s(host, httpHeader->host);
+	//处理网站引导
+	unordered_map<string, string>::iterator it = myproxy->redirect.find(httpHeader->host);
+	if (it != myproxy->redirect.end())
+	{
+		const int len = it->second.length();
+		char * c = new char[len + 1];
+		strcpy_s(c, len+1,it->second.c_str());
+		if (!ConnectToServer(&static_cast<ProxyParam*>(lpParameter)->serverSocket, c))
+		{
+			cout << "连接服务器失败！" << endl;
+			Sleep(200);
+			for (int i = 0;closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket) == SOCKET_ERROR && i < 10;i++);
+			//closesocket(static_cast<ProxyParam*>(lpParameter)->serverSocket);
+			delete httpHeader;
+			_endthreadex(0);
+			return 0;
+		}
+		delete[] c;
+	}
+	else
+	{
+		if (!ConnectToServer(&static_cast<ProxyParam*>(lpParameter)->serverSocket, httpHeader->host))
+		{
+			cout << "连接服务器失败！" << endl;
+			Sleep(200);
+			for (int i = 0;closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket) == SOCKET_ERROR && i < 10;i++);
+			//closesocket(static_cast<ProxyParam*>(lpParameter)->serverSocket);
+			delete httpHeader;
+			_endthreadex(0);
+			return 0;
+		}
+	}
+	//去除浏览器添加的代理标识
 	unsigned int  len = strlen(Buffer);
 	temp = new char[len + 1];
 	buffer = new char[len + 1];
@@ -165,29 +212,20 @@ inline unsigned int __stdcall MyProxy::ProxyThread(LPVOID lpParameter)
 		buffer[i] = temp[i];
 	}
 	delete[] temp;
-	if (!ConnectToServer(&static_cast<ProxyParam*>(lpParameter)->serverSocket, httpHeader->host))
-	{
-		std::cout << "连接服务器失败！" << std::endl;
-		goto error;
-	}
 	//printf("代理连接主机 %s 成功\n", httpHeader->host);
 	//将客户端发送的 HTTP 数据报文直接转发给目标服务器
-	int ret = send(static_cast<ProxyParam *>(lpParameter)->serverSocket, buffer, recvSize, 0);
+	int ret3 = send(static_cast<ProxyParam *>(lpParameter)->serverSocket, buffer, recvSize, 0);
 	//等待目标服务器返回数据
-	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->serverSocket, Buffer, MAXSIZE+1, 0);
+	recvSize = recv(static_cast<ProxyParam*>(lpParameter)->serverSocket, Buffer, MAXSIZE, 0);
 	if (recvSize <= 0)
-	{
-		std::cout << "服务器没有返回数据！" << std::endl;
-		goto error;
-	}
+		cout << "服务器没有返回数据！" << endl;
 	//将目标服务器返回的数据直接转发给客户端 
-	ret = send(static_cast<ProxyParam*>(lpParameter)->clientSocket, Buffer, sizeof(Buffer), 0);
-	//错误处理
-error:
+	int ret1 = send(static_cast<ProxyParam*>(lpParameter)->clientSocket, Buffer, sizeof(Buffer), 0);
 	Sleep(200);
-	closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket);
-	closesocket(static_cast<ProxyParam*>(lpParameter)->serverSocket);
-	delete lpParameter;
+	for (int i = 0;closesocket(static_cast<ProxyParam*>(lpParameter)->clientSocket) == SOCKET_ERROR && i < 10;i++);
+	int ret2 = closesocket(static_cast<ProxyParam*>(lpParameter)->serverSocket);
+	delete httpHeader;
+//	delete[] buffer;
 	_endthreadex(0);
 	return 0;
 }
